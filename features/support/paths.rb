@@ -19,6 +19,9 @@ module NavigationHelpers
     when /^the search works page$/i
       Work.tire.index.refresh
       search_works_path      
+    when /^the search people page$/i
+      Pseud.tire.index.refresh
+      search_people_path
 
     # the following are examples using path_to_pickle
 
@@ -89,7 +92,7 @@ module NavigationHelpers
     when /the import page/
       new_work_path(:import => 'true')
     when /the work-skins page/
-      skins_path(:work_skins => true)
+      skins_path(:skin_type => "WorkSkin")
     when /^(.*)'s skin page/
       skins_path(:user_id => $1)
     when /^"(.*)" skin page/

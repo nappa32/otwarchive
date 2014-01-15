@@ -25,9 +25,13 @@ class Tag < ActiveRecord::Base
   def commentable_name
     self.name
   end
+
+  # For a tag, the commentable owners are the wranglers of the fandom(s)
   def commentable_owners
+    # if the tag is a fandom, grab its wranglers or the wranglers of its canonical merger
     if self.is_a?(Fandom)
-      self.wranglers
+      self.canonical? ? self.wranglers : (self.merger_id ? self.merger.wranglers : [])
+    # if the tag is any other tag, try to grab all the wranglers of all its parent fandoms, if applicable
     else
       begin
         self.fandoms.collect {|f| f.wranglers}.compact.flatten.uniq
@@ -97,6 +101,16 @@ class Tag < ActiveRecord::Base
     if unwrangleable? && (canonical? || merger_id.present?)
       self.errors.add(:unwrangleable, "can't be set on a canonical or synonymized tag.")
     end
+
+    if unwrangleable? && is_a?(UnsortedTag)
+      self.errors.add(:unwrangleable, "can't be set on an unsorted tag.")
+    end
+  end
+
+  before_update :remove_index_for_type_change, if: :type_changed?
+  def remove_index_for_type_change
+    @destroyed = true
+    tire.update_index
   end
 
   before_validation :check_synonym
@@ -128,7 +142,9 @@ class Tag < ActiveRecord::Base
 
   before_validation :set_sortable_name
   def set_sortable_name
-    self.sortable_name = remove_articles_from_string(self.name)
+    if sortable_name.blank?
+      self.sortable_name = remove_articles_from_string(self.name)
+    end
   end
 
   before_save :set_last_wrangler
@@ -314,7 +330,11 @@ class Tag < ActiveRecord::Base
 
   # We can pass this any Tag instance method that we want to run later.
   def async(method, *args)
-    Resque.enqueue(Tag, id, method, *args)
+    if Rails.env.test?
+      send(method, *args)
+    else
+      Resque.enqueue(Tag, id, method, *args)
+    end
   end
 
   # Class methods
@@ -536,6 +556,13 @@ class Tag < ActiveRecord::Base
     self.unwrangled? && self.set_taggings.count == 0 && self.works.count == 0
   end
 
+  # tags having their type changed need to be reloaded to be seen as an instance of the proper subclass
+  def recategorize(new_type)
+    self.update_attribute(:type, new_type)
+    # return a new instance of the tag, with the correct class
+    Tag.find(self.id)
+  end
+
   #### FILTERING ####
   
   include WorksOwner  
@@ -576,7 +603,7 @@ class Tag < ActiveRecord::Base
     if work_ids.empty? 
       work_ids = all_filtered_work_ids
     end
-    RedisSearchIndexQueue.queue_works(work_ids)
+    RedisSearchIndexQueue.queue_works(work_ids, priority: :low)
   end
 
   # In the case of works, the filter_taggings table already collects all the things tagged
@@ -593,7 +620,7 @@ class Tag < ActiveRecord::Base
     if bookmark_ids.empty?
       bookmark_ids = all_bookmark_ids
     end
-    RedisSearchIndexQueue.queue_bookmarks(bookmark_ids)
+    RedisSearchIndexQueue.queue_bookmarks(bookmark_ids, priority: :low)
   end
   
   # We call this to get the ids of all the bookmarks that are tagged by this tag or its subtags
@@ -791,7 +818,7 @@ class Tag < ActiveRecord::Base
     self.filtered_works.each do |work|        
       unless work.filters.include?(meta_tag)
         work.filter_taggings.create!(:inherited => true, :filter_id => meta_tag.id)
-        RedisSearchIndexQueue.reindex(work)
+        RedisSearchIndexQueue.reindex(work, priority: :low)
       end
     end
   end
@@ -918,7 +945,7 @@ class Tag < ActiveRecord::Base
         if work.filters.include?(tag) && (work.filters & other_sub_tags).empty?
           unless work.tags.include?(tag) || !(work.tags & tag.mergers).empty?
             work.filters.delete(tag)
-            RedisSearchIndexQueue.reindex(work)
+            RedisSearchIndexQueue.reindex(work, priority: :low)
           end
         end
       end
@@ -1005,7 +1032,7 @@ class Tag < ActiveRecord::Base
         if new_merger && new_merger == self
           self.errors.add(:base, tag_string + " is considered the same as " + self.name + " by the database.")
         elsif new_merger && !new_merger.canonical?
-          self.errors.add(:base, new_merger.name + " is not a canonical tag. Please make it canonical before adding synonyms to it.")
+          self.errors.add(:base, '<a href="/tags/' + new_merger.to_param + '/edit">' + new_merger.name + '</a> is not a canonical tag. Please make it canonical before adding synonyms to it.')
         elsif new_merger && new_merger.class != self.class
           self.errors.add(:base, new_merger.name + " is a #{new_merger.type.to_s.downcase}. Synonyms must belong to the same category.")
         elsif !new_merger
